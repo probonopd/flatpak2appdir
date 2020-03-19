@@ -2,6 +2,12 @@
 
 HERE="$(dirname "$(readlink -f "${0}")")"
 
+[ "${1}" = "--force-runtime" ] && {
+  shift
+  runtime_name=${1}; shift
+  runtime_version=${1}; shift
+}
+
 [ "${1}" = "" ] && {
   echo "You must pass a app id as argument for e.g.:"
   echo "  sudo ${0} org.gnome.gedit"
@@ -20,14 +26,16 @@ HERE="$(dirname "$(readlink -f "${0}")")"
   echo "  flatpak install --system ${1}"
   exit 1
 }
-  
-runtime_info=$(cat "/var/lib/flatpak/app/${1}/current/active/files/manifest.json" | grep runtime   \
-                                                                                  | sed 's/ *"//g' \
-                                                                                  | cut -d':' -f2  \
-                                                                                  | rev)
 
-runtime_name=$(echo "${runtime_info}"    | sed -n 1p | cut -c 2- | rev)
-runtime_version=$(echo "${runtime_info}" | sed -n 2p | cut -c 2- | rev)
+[ "${runtime_name}" = ""  ] && {
+  runtime_info=$(cat "/var/lib/flatpak/app/${1}/current/active/files/manifest.json" | grep runtime   \
+                                                                                    | sed 's/ *"//g' \
+                                                                                    | cut -d':' -f2  \
+                                                                                    | rev)
+
+  runtime_name=$(echo "${runtime_info}"    | sed -n 1p | cut -c 2- | rev)
+  runtime_version=$(echo "${runtime_info}" | sed -n 2p | cut -c 2- | rev)
+}
   
 app="/var/lib/flatpak/app/${1}/current/active/files/"
 runtime="/var/lib/flatpak/runtime/${runtime_name}/x86_64/${runtime_version}/active/files"
@@ -50,7 +58,7 @@ sudo mount -o loop,strictatime,nodiratime ${runtime_name}_${runtime_version}.img
 echo "[ 3/7 ] Copying runtime to image"
 [ ! -f "${mount_point}/bin/bash" ] && {
   sudo mkdir -p ${mount_point}/usr
-  sudo sudo cp -vr ${runtime}/* ${mount_point}/usr
+  sudo sudo cp -r ${runtime}/* ${mount_point}/usr
   sudo ln -s usr/bin   ${mount_point}/bin
   sudo ln -s usr/lib   ${mount_point}/lib
   sudo ln -s usr/lib64 ${mount_point}/lib64
@@ -73,21 +81,34 @@ mount -t proc proc ${mount_point}/proc/
 mkdir -p ${mount_point}/${HOME}
 xhost +local:
 
-echo '#!/bin/bash' > ${mount_point}/AppRun
-echo 'python3 --version' >> ${mount_point}/AppRun
-echo 'export PATH=/app/bin:/usr/bin:${PATH}' >> ${mount_point}/AppRun
-echo 'export LD_LIBRARY_PATH=/app/bin:/app/lib:${LD_LIBRARY_PATH}' >> ${mount_point}/AppRun
-echo 'export GSETTINGS_SCHEMA_DIR=/app/share/glib-2.0/schemas' >> ${mount_point}/AppRun
-echo 'export GI_TYPELIB_PATH=/app/lib/girepository-1.0' >> ${mount_point}/AppRun
-echo '${@}' >> ${mount_point}/AppRun
-chmod +x ${mount_point}/AppRun
-
 echo "[ 7/7 ] Copying used files..."
+command_path="${mount_point}/app/bin/${command}"
+[ "$(cat ${command_path} | head -n1 | cut -c 1-2)" = "#!" ] && {
+  interpreter=$(cat ${command_path} | head -n1 | cut -c 3-)
+}
+
+export PATH=/app/bin:/usr/bin:${PATH}
+export LD_LIBRARY_PATH=/app/bin:/app/lib:${LD_LIBRARY_PATH}
+export GSETTINGS_SCHEMA_DIR=/app/share/glib-2.0/schemas
+export GI_TYPELIB_PATH=/app/lib/girepository-1.0
+export XDG_DATA_DIRS=/app/usr/share/:/usr/share/:"${XDG_DATA_DIRS}"
 touch ${mount_point}/test
-chroot ${mount_point} /AppRun ${command}
-mkdir -p ${1}.AppDir
+chroot ${mount_point} ${command} &
+                        
+APID=$!
+sleep 15
+kill $APID
+mkdir -p ${1}.AppDir/usr
 find ${mount_point} -mindepth 3 -anewer ${mount_point}/test -not -path '*/proc/*' -not -path '*/home/*' | sed 's/^/cp -P --parents /g' | sed "s|$| ${1}.AppDir|g" | sh
-cp -r ${mount_point}/app ${1}.AppDir
+
+[ -f "${1}.AppDir/${mount_point}/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache" ] && {
+  cp --parents -r /${mount_point}/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders/* ${1}.AppDir
+}
+
+[ -d "${1}.AppDir/${mount_point}/usr/lib/python3.7/encodings" ] && {
+  cp --parents -r /${mount_point}/usr/lib/python3.7/encodings/* ${1}.AppDir
+}
+
 mv ${1}.AppDir/${mount_point}/* ${1}.AppDir/
 rm -rf ${1}.AppDir/tmp
 ln -s usr/bin   ${1}.AppDir/bin
@@ -96,14 +117,33 @@ ln -s usr/lib64 ${1}.AppDir/lib64
 ln -s usr/etc   ${1}.AppDir/etc
 ln -s usr/bin   ${1}.AppDir/sbin
 cp ${HERE}/libunionpreload.so ${1}.AppDir
-cp ${HERE}/start-app.sh ${1}.AppDir
-  
+cp ${HERE}/start-app.sh ${1}.AppDir/AppRun
+
+[ ! -z "${interpreter}" ] && {
+  echo -n ${interpreter} >> ${1}.AppDir/interpreter
+}
+
+echo -n ${command} >> ${1}.AppDir/command
+
+mv ${1}.AppDir/usr/share/glib-2.0/schemas ${1}.AppDir/usr/share/runtime-schemas
+cp -r ${mount_point}/app/* ${1}.AppDir/usr
+ln -s usr ${1}.AppDir/app
+
+cp ${1}.AppDir/usr/share/applications/${1}.desktop ${1}.AppDir/
+ln -s app/share/app-info/icons/flatpak/128x128/${1}.png ${1}.AppDir/
+
+sed -i -e 's|DBusActivatable|X-DBusActivatable|g' ${1}.AppDir/${1}.desktop
+sed -i -e 's|Keywords|X-Keywords|g' ${1}.AppDir/${1}.desktop
+
 chmod -R a+rwx ${1}.AppDir/
 
 echo "[ 7/7 ] Finishing..."
-umount ${mount_point}
-umount ${mount_point}/app
-umount ${mount_point}/proc
-umount ${mount_point}
+sleep 1
+sync
+sleep 1
+# umount -l ${mount_point}
+umount -l ${mount_point}/app
+umount -l ${mount_point}/proc
+umount -l ${mount_point}
 
 rm -rfv ${mount_point}
